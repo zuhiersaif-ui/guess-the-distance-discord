@@ -61,7 +61,7 @@ async function loadPeak() {
   const messages = await target.messages.fetch({ limit: 100 });
   for (const message of messages.values()) {
     for (const embed of message.embeds) {
-      if (embed.footer?.text !== "GTD_PEAK") continue;
+      if (embed.title !== "New player peak!") continue;
       const players = Number(embed.fields?.find((field) => field.name === "Players")?.value || 0);
       if (players > state.peakPlayers) state.peakPlayers = players;
     }
@@ -85,7 +85,6 @@ async function announcePeak() {
       { name: "Previous peak", value: String(previous), inline: true },
     )
     .setColor(0xf1c40f)
-    .setFooter({ text: "GTD_PEAK" })
     .setTimestamp();
   await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
 }
@@ -121,17 +120,22 @@ async function updateLeaderboardMessage(category) {
   if (!target?.isTextBased()) return;
   const rows = state.leaderboard[category] || [];
   const labels = { wins: "Most Wins", richest: "Richest Players", streak: "Best Streaks", donate: "Top Donators", fastest: "Fastest Times" };
+  const formatValue = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return clean(value);
+    if (category === "fastest") return `${((10_000_000_000 - number) / 1_000_000).toFixed(3)}s`;
+    return Math.round(number).toLocaleString("en-US");
+  };
   const body = rows.length
-    ? rows.map((row, index) => `**${index + 1}.** ${clean(row.displayName || row.name)} — ${clean(row.value)}`).join("\n").slice(0, 3900)
+    ? rows.map((row, index) => `**${index + 1}.** ${clean(row.displayName || row.name)} — ${formatValue(row.value)}`).join("\n").slice(0, 3900)
     : "Waiting for the first game snapshot.";
   const embed = new EmbedBuilder()
     .setTitle(labels[category] || category)
     .setDescription(body)
     .setColor(0x9b59b6)
-    .setFooter({ text: `GTD_LEADERBOARD_${category}` })
     .setTimestamp();
   const messages = await target.messages.fetch({ limit: 100 });
-  const previous = messages.find((message) => message.author.id === client.user.id && message.embeds[0]?.footer?.text === `GTD_LEADERBOARD_${category}`);
+  const previous = messages.find((message) => message.author.id === client.user.id && message.embeds[0]?.title === (labels[category] || category));
   if (previous) await previous.edit({ embeds: [embed] });
   else await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
 }
