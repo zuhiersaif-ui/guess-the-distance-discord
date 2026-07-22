@@ -53,17 +53,16 @@ function allPlayers() {
 
 async function loadPeak() {
   if (state.peakLoaded) return;
-  const target = await channel("CHANNEL_GAME_EVENTS");
-  if (!target?.isTextBased()) {
-    state.peakLoaded = true;
-    return;
-  }
-  const messages = await target.messages.fetch({ limit: 100 });
-  for (const message of messages.values()) {
-    for (const embed of message.embeds) {
-      if (embed.title !== "New player peak!") continue;
-      const players = Number(embed.fields?.find((field) => field.name === "Players")?.value || 0);
-      if (players > state.peakPlayers) state.peakPlayers = players;
+  for (const envName of ["CHANNEL_ANNOUNCEMENTS", "CHANNEL_GAME_EVENTS"]) {
+    const target = await channel(envName);
+    if (!target?.isTextBased()) continue;
+    const messages = await target.messages.fetch({ limit: 100 });
+    for (const message of messages.values()) {
+      for (const embed of message.embeds) {
+        if (embed.title !== "New player peak!") continue;
+        const players = Number(embed.fields?.find((field) => field.name === "Players")?.value || 0);
+        if (players > state.peakPlayers) state.peakPlayers = players;
+      }
     }
   }
   state.peakLoaded = true;
@@ -75,7 +74,7 @@ async function announcePeak() {
   if (count <= state.peakPlayers || count < 1) return;
   const previous = state.peakPlayers;
   state.peakPlayers = count;
-  const target = await channel("CHANNEL_GAME_EVENTS");
+  const target = await channel("CHANNEL_ANNOUNCEMENTS");
   if (!target?.isTextBased()) return;
   const embed = new EmbedBuilder()
     .setTitle("New player peak!")
@@ -165,7 +164,9 @@ app.post("/roblox/event", async (req, res) => {
       ["User ID", p.userId || "unknown"],
       ["Message", req.body.message, false],
     ], 0xfee75c);
-  } else if (["join", "leave", "round_win", "record"].includes(event)) {
+  } else if (event === "record") {
+    await announce("CHANNEL_ANNOUNCEMENTS", "New game record", [["Player", p.displayName || p.name], ["Details", req.body.details || "—", false]], 0xf1c40f);
+  } else if (["join", "leave", "round_win"].includes(event)) {
     await announce("CHANNEL_GAME_EVENTS", event.replaceAll("_", " "), [["Player", p.displayName || p.name], ["Details", req.body.details || "—", false]], 0x3498db);
   }
   res.json({ ok: true });
