@@ -116,6 +116,26 @@ async function announce(envName, title, fields, color = 0x57f287) {
   await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
 }
 
+async function updateLeaderboardMessage(category) {
+  const target = await channel("CHANNEL_LEADERBOARDS");
+  if (!target?.isTextBased()) return;
+  const rows = state.leaderboard[category] || [];
+  const labels = { wins: "Most Wins", richest: "Richest Players", streak: "Best Streaks", donate: "Top Donators", fastest: "Fastest Times" };
+  const body = rows.length
+    ? rows.map((row, index) => `**${index + 1}.** ${clean(row.displayName || row.name)} — ${clean(row.value)}`).join("\n").slice(0, 3900)
+    : "Waiting for the first game snapshot.";
+  const embed = new EmbedBuilder()
+    .setTitle(labels[category] || category)
+    .setDescription(body)
+    .setColor(0x9b59b6)
+    .setFooter({ text: `GTD_LEADERBOARD_${category}` })
+    .setTimestamp();
+  const messages = await target.messages.fetch({ limit: 100 });
+  const previous = messages.find((message) => message.author.id === client.user.id && message.embeds[0]?.footer?.text === `GTD_LEADERBOARD_${category}`);
+  if (previous) await previous.edit({ embeds: [embed] });
+  else await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
+}
+
 app.use("/roblox", (req, res, next) => {
   if (!authorized(req)) return res.status(401).json({ error: "unauthorized" });
   next();
@@ -135,16 +155,24 @@ app.post("/roblox/event", async (req, res) => {
   if (event === "purchase") {
     await announce("CHANNEL_PURCHASES", "New Roblox purchase", [["Player", p.displayName || p.name], ["Item", req.body.itemName || req.body.productId], ["Robux", req.body.robux || "unknown"], ["User ID", p.userId]]);
   } else if (event === "chat" && process.env.ENABLE_CHAT_RELAY === "true") {
-    await announce("CHANNEL_CHAT_LOG", "Filtered game chat", [["Player", p.displayName || p.name], ["Message", req.body.message, false]], 0xfee75c);
+    await announce("CHANNEL_CHAT_LOG", "Game chat", [
+      ["Display name", p.displayName || p.name],
+      ["Username", `@${p.name || "unknown"}`],
+      ["User ID", p.userId || "unknown"],
+      ["Message", req.body.message, false],
+    ], 0xfee75c);
   } else if (["join", "leave", "round_win", "record"].includes(event)) {
     await announce("CHANNEL_GAME_EVENTS", event.replaceAll("_", " "), [["Player", p.displayName || p.name], ["Details", req.body.details || "—", false]], 0x3498db);
   }
   res.json({ ok: true });
 });
 
-app.post("/roblox/leaderboard", (req, res) => {
+app.post("/roblox/leaderboard", async (req, res) => {
   const category = clean(req.body.category, 30);
-  if (Object.hasOwn(state.leaderboard, category) && Array.isArray(req.body.rows)) state.leaderboard[category] = req.body.rows.slice(0, 25);
+  if (Object.hasOwn(state.leaderboard, category) && Array.isArray(req.body.rows)) {
+    state.leaderboard[category] = req.body.rows.slice(0, 25);
+    await updateLeaderboardMessage(category);
+  }
   res.json({ ok: true });
 });
 
