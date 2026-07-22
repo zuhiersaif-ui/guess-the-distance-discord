@@ -24,6 +24,8 @@ app.use(express.json({ limit: "64kb" }));
 const state = {
   servers: new Map(),
   leaderboard: { wins: [], richest: [], streak: [], donate: [], fastest: [] },
+  peakPlayers: 0,
+  peakLoaded: false,
 };
 
 app.get("/", (_req, res) => res.json({ ok: true, service: "guess-the-distance-discord" }));
@@ -47,6 +49,45 @@ async function channel(envName) {
 
 function allPlayers() {
   return [...state.servers.values()].flatMap((server) => server.players || []);
+}
+
+async function loadPeak() {
+  if (state.peakLoaded) return;
+  const target = await channel("CHANNEL_GAME_EVENTS");
+  if (!target?.isTextBased()) {
+    state.peakLoaded = true;
+    return;
+  }
+  const messages = await target.messages.fetch({ limit: 100 });
+  for (const message of messages.values()) {
+    for (const embed of message.embeds) {
+      if (embed.footer?.text !== "GTD_PEAK") continue;
+      const players = Number(embed.fields?.find((field) => field.name === "Players")?.value || 0);
+      if (players > state.peakPlayers) state.peakPlayers = players;
+    }
+  }
+  state.peakLoaded = true;
+}
+
+async function announcePeak() {
+  await loadPeak();
+  const count = allPlayers().length;
+  if (count <= state.peakPlayers || count < 1) return;
+  const previous = state.peakPlayers;
+  state.peakPlayers = count;
+  const target = await channel("CHANNEL_GAME_EVENTS");
+  if (!target?.isTextBased()) return;
+  const embed = new EmbedBuilder()
+    .setTitle("New player peak!")
+    .setDescription(`Guess the Distance just reached **${count} concurrent player${count === 1 ? "" : "s"}**.`)
+    .addFields(
+      { name: "Players", value: String(count), inline: true },
+      { name: "Previous peak", value: String(previous), inline: true },
+    )
+    .setColor(0xf1c40f)
+    .setFooter({ text: "GTD_PEAK" })
+    .setTimestamp();
+  await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
 }
 
 async function updatePresence() {
@@ -84,6 +125,7 @@ app.post("/roblox/heartbeat", async (req, res) => {
   const jobId = clean(req.body.jobId, 100);
   state.servers.set(jobId, { players: Array.isArray(req.body.players) ? req.body.players.slice(0, 100) : [], updatedAt: Date.now() });
   await updatePresence();
+  await announcePeak();
   res.json({ ok: true });
 });
 
@@ -136,6 +178,7 @@ client.on("interactionCreate", async (interaction) => {
 client.once("ready", async () => {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(client.user.id, process.env.DISCORD_GUILD_ID), { body: commands });
+  await loadPeak();
   await updatePresence();
   console.log(`Discord bot ready as ${client.user.tag}`);
 });
