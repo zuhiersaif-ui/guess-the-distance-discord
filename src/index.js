@@ -24,8 +24,11 @@ app.use(express.json({ limit: "64kb" }));
 const state = {
   servers: new Map(),
   leaderboard: { wins: [], richest: [], streak: [], donate: [], fastest: [] },
+  relayMessages: [],
+  nextRelayId: 1,
   peakPlayers: 0,
   peakLoaded: false,
+  totals: { joins: 0, leaves: 0, purchases: 0, chatMessages: 0, moderationActions: 0 },
 };
 
 app.get("/", (_req, res) => res.json({ ok: true, service: "guess-the-distance-discord" }));
@@ -38,7 +41,24 @@ function authorized(req) {
 }
 
 function clean(value, max = 200) {
-  return String(value ?? "").replace(/@/g, "＠").replace(/[\r\n]+/g, " ").slice(0, max);
+  return String(value ?? "").replace(/@/g, "＠").replace(/[\r\n]+/g, " ").trim().slice(0, max);
+}
+
+function detailText(value) {
+  if (value == null) return "—";
+  if (typeof value !== "object") return clean(value, 1000) || "—";
+  return Object.entries(value)
+    .filter(([, item]) => ["string", "number", "boolean"].includes(typeof item))
+    .map(([key, item]) => `${clean(key, 50)}: ${clean(item, 200)}`)
+    .join(" • ")
+    .slice(0, 1000) || "—";
+}
+
+function productionPayload(body) {
+  const jobId = clean(body?.jobId || body?.server?.jobId, 100).toLowerCase();
+  const environment = clean(body?.server?.environment, 30).toLowerCase();
+  if (!jobId || jobId === "studio") return false;
+  return !environment || environment === "production";
 }
 
 async function channel(envName) {
@@ -49,6 +69,22 @@ async function channel(envName) {
 
 function allPlayers() {
   return [...state.servers.values()].flatMap((server) => server.players || []);
+}
+
+function queueRelay(author, content) {
+  const message = {
+    id: state.nextRelayId++,
+    author: clean(author, 80) || "Discord Staff",
+    content: clean(content, 240),
+    authorRobloxUserId: Number(process.env.ROBLOX_RELAY_AUTHOR_ID || 1552888256),
+    createdAt: Date.now(),
+  };
+  if (!message.content) return null;
+  state.relayMessages.push(message);
+  state.relayMessages = state.relayMessages
+    .filter((item) => item.createdAt > Date.now() - 10 * 60_000)
+    .slice(-100);
+  return message;
 }
 
 async function loadPeak() {
@@ -91,17 +127,30 @@ async function announcePeak() {
 async function updatePresence() {
   if (!client.user) return;
   const count = allPlayers().length;
+  const serverCount = state.servers.size;
   client.user.setActivity(`${count} player${count === 1 ? "" : "s"} guessing`);
   const target = await channel("CHANNEL_LIVE_PLAYERS");
   if (!target?.isTextBased()) return;
-  const rows = allPlayers().slice(0, 50).map((p) => `• ${clean(p.displayName || p.name)} — ${Number(p.wins || 0)} wins`).join("\n");
+  const rows = allPlayers().slice(0, 25)
+    .map((p) => `• **${clean(p.displayName || p.name)}** — ${Number(p.wins || 0).toLocaleString("en-US")} wins`)
+    .join("\n");
   const embed = new EmbedBuilder()
-    .setTitle(`Live players: ${count}`)
-    .setDescription(rows || "No players online")
+    .setTitle("Guess the Distance • Live Status")
+    .setDescription(rows || "No published servers currently have players online.")
+    .addFields(
+      { name: "Players", value: String(count), inline: true },
+      { name: "Servers", value: String(serverCount), inline: true },
+      { name: "Peak", value: String(state.peakPlayers), inline: true },
+    )
     .setColor(0x5865f2)
+    .setFooter({ text: "Published servers only • refreshes automatically" })
     .setTimestamp();
   const messages = await target.messages.fetch({ limit: 10 });
-  const previous = messages.find((m) => m.author.id === client.user.id && m.embeds[0]?.title?.startsWith("Live players:"));
+  const previous = messages.find((message) => {
+    if (message.author.id !== client.user.id) return false;
+    const title = message.embeds[0]?.title || "";
+    return title === "Guess the Distance • Live Status" || title.startsWith("Live players:");
+  });
   if (previous) await previous.edit({ embeds: [embed] });
   else await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
 }
@@ -110,7 +159,11 @@ async function announce(envName, title, fields, color = 0x57f287) {
   const target = await channel(envName);
   if (!target?.isTextBased()) return;
   const embed = new EmbedBuilder().setTitle(clean(title)).setColor(color).setTimestamp();
-  embed.addFields(fields.map(([name, value, inline = true]) => ({ name: clean(name, 100), value: clean(value, 1000) || "—", inline })));
+  embed.addFields(fields.map(([name, value, inline = true]) => ({
+    name: clean(name, 100),
+    value: detailText(value),
+    inline,
+  })));
   await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
 }
 
@@ -126,12 +179,13 @@ async function updateLeaderboardMessage(category) {
     return Math.round(number).toLocaleString("en-US");
   };
   const body = rows.length
-    ? rows.map((row, index) => `**${index + 1}.** ${clean(row.displayName || row.name)} — ${formatValue(row.value)}`).join("\n").slice(0, 3900)
+    ? rows.map((row, index) => `${["🥇", "🥈", "🥉"][index] || `**${index + 1}.**`} **${clean(row.displayName || row.name)}** — ${formatValue(row.value)}`).join("\n").slice(0, 3900)
     : "Waiting for the first game snapshot.";
   const embed = new EmbedBuilder()
     .setTitle(labels[category] || category)
     .setDescription(body)
     .setColor(0x9b59b6)
+    .setFooter({ text: "Live production leaderboard • top 25" })
     .setTimestamp();
   const messages = await target.messages.fetch({ limit: 100 });
   const previous = messages.find((message) => message.author.id === client.user.id && message.embeds[0]?.title === (labels[category] || category));
@@ -145,19 +199,31 @@ app.use("/roblox", (req, res, next) => {
 });
 
 app.post("/roblox/heartbeat", async (req, res) => {
+  if (!productionPayload(req.body)) {
+    return res.status(202).json({ ok: true, ignored: "non-production" });
+  }
   const jobId = clean(req.body.jobId, 100);
-  state.servers.set(jobId, { players: Array.isArray(req.body.players) ? req.body.players.slice(0, 100) : [], updatedAt: Date.now() });
+  state.servers.set(jobId, {
+    players: Array.isArray(req.body.players) ? req.body.players.slice(0, 100) : [],
+    server: req.body.server || {},
+    updatedAt: Date.now(),
+  });
   await updatePresence();
   await announcePeak();
   res.json({ ok: true });
 });
 
 app.post("/roblox/event", async (req, res) => {
+  if (!productionPayload(req.body)) {
+    return res.status(202).json({ ok: true, ignored: "non-production" });
+  }
   const event = clean(req.body.event, 40);
   const p = req.body.player || {};
   if (event === "purchase") {
+    state.totals.purchases += 1;
     await announce("CHANNEL_PURCHASES", "New Roblox purchase", [["Player", p.displayName || p.name], ["Item", req.body.itemName || req.body.productId], ["Robux", req.body.robux || "unknown"], ["User ID", p.userId]]);
   } else if (event === "chat" && process.env.ENABLE_CHAT_RELAY === "true") {
+    state.totals.chatMessages += 1;
     await announce("CHANNEL_CHAT_LOG", "Game chat", [
       ["Display name", p.displayName || p.name],
       ["Username", `@${p.name || "unknown"}`],
@@ -166,13 +232,39 @@ app.post("/roblox/event", async (req, res) => {
     ], 0xfee75c);
   } else if (event === "record") {
     await announce("CHANNEL_ANNOUNCEMENTS", "New game record", [["Player", p.displayName || p.name], ["Details", req.body.details || "—", false]], 0xf1c40f);
+  } else if (event === "moderation") {
+    state.totals.moderationActions += 1;
+    const details = req.body.details || {};
+    await announce("CHANNEL_GAME_EVENTS", "Moderation action", [
+      ["Moderator", p.displayName || p.name || "Unknown"],
+      ["Action", details.action || "unknown"],
+      ["Target", details.targetName || details.targetUserId || "Server"],
+      ["Details", details.reason || details.message || details.result || details.failed, false],
+    ], 0xed4245);
+  } else if (event === "server_start") {
+    await announce("CHANNEL_GAME_EVENTS", "Server online", [
+      ["Server", req.body.jobId],
+      ["Details", req.body.details, false],
+    ], 0x57f287);
+  } else if (event === "server_stop") {
+    state.servers.delete(clean(req.body.jobId, 100));
+    await updatePresence();
+    await announce("CHANNEL_GAME_EVENTS", "Server offline", [
+      ["Server", req.body.jobId],
+      ["Details", req.body.details, false],
+    ], 0x747f8d);
   } else if (["join", "leave", "round_win"].includes(event)) {
+    if (event === "join") state.totals.joins += 1;
+    if (event === "leave") state.totals.leaves += 1;
     await announce("CHANNEL_GAME_EVENTS", event.replaceAll("_", " "), [["Player", p.displayName || p.name], ["Details", req.body.details || "—", false]], 0x3498db);
   }
   res.json({ ok: true });
 });
 
 app.post("/roblox/leaderboard", async (req, res) => {
+  if (!productionPayload(req.body)) {
+    return res.status(202).json({ ok: true, ignored: "non-production" });
+  }
   const category = clean(req.body.category, 30);
   if (Object.hasOwn(state.leaderboard, category) && Array.isArray(req.body.rows)) {
     state.leaderboard[category] = req.body.rows.slice(0, 25);
@@ -181,8 +273,28 @@ app.post("/roblox/leaderboard", async (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/roblox/messages", (req, res) => {
+  const after = Math.max(0, Number(req.query.after) || 0);
+  const messages = state.relayMessages.filter((message) => message.id > after).slice(0, 20);
+  res.json({
+    ok: true,
+    messages,
+    cursor: messages.at(-1)?.id || after,
+  });
+});
+
 const commands = [
   new SlashCommandBuilder().setName("players").setDescription("Show active Guess the Distance players"),
+  new SlashCommandBuilder().setName("status").setDescription("Show live production server and analytics status"),
+  new SlashCommandBuilder()
+    .setName("broadcast")
+    .setDescription("Send a filtered staff message into every live Roblox server")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addStringOption((option) => option
+      .setName("message")
+      .setDescription("Message to display in-game")
+      .setRequired(true)
+      .setMaxLength(240)),
   new SlashCommandBuilder().setName("leaderboard").setDescription("Show a game leaderboard").addStringOption((o) => o.setName("category").setDescription("Leaderboard category").setRequired(true).addChoices(
     { name: "Wins", value: "wins" }, { name: "Richest", value: "richest" }, { name: "Streak", value: "streak" }, { name: "Donations", value: "donate" }, { name: "Fastest", value: "fastest" }
   )),
@@ -194,6 +306,33 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "players") {
     const players = allPlayers();
     await interaction.reply({ content: players.length ? players.map((p) => `• ${clean(p.displayName || p.name)} — ${Number(p.wins || 0)} wins`).join("\n").slice(0, 1900) : "No players are online.", ephemeral: true });
+  } else if (interaction.commandName === "status") {
+    await interaction.reply({
+      embeds: [new EmbedBuilder()
+        .setTitle("Production status")
+        .addFields(
+          { name: "Players", value: String(allPlayers().length), inline: true },
+          { name: "Servers", value: String(state.servers.size), inline: true },
+          { name: "Peak", value: String(state.peakPlayers), inline: true },
+          { name: "Joins", value: String(state.totals.joins), inline: true },
+          { name: "Purchases", value: String(state.totals.purchases), inline: true },
+          { name: "Moderation", value: String(state.totals.moderationActions), inline: true },
+        )
+        .setColor(0x5865f2)
+        .setTimestamp()],
+      ephemeral: true,
+    });
+  } else if (interaction.commandName === "broadcast") {
+    const queued = queueRelay(
+      interaction.user.globalName || interaction.user.username,
+      interaction.options.getString("message", true),
+    );
+    await interaction.reply({
+      content: queued
+        ? `Queued for ${state.servers.size} live Roblox server${state.servers.size === 1 ? "" : "s"}.`
+        : "Message was empty.",
+      ephemeral: true,
+    });
   } else if (interaction.commandName === "leaderboard") {
     const category = interaction.options.getString("category", true);
     const rows = state.leaderboard[category] || [];
