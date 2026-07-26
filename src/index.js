@@ -347,7 +347,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(client.user.id, process.env.DISCORD_GUILD_ID), { body: commands });
   await loadPeak();
