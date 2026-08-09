@@ -81,13 +81,30 @@ async function translateWebhookMessage(message) {
     const content = player
       ? `🌐 **${clean(player, 80)}:** ${translated}`
       : `🌐 ${translated}`;
-    await message.reply({
+    await discordApi(`/channels/${message.channelId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({
       content: content.slice(0, 2000),
-      allowedMentions: { parse: [], repliedUser: false },
+        message_reference: { message_id: message.id, fail_if_not_exists: false },
+        allowed_mentions: { parse: [], replied_user: false },
+      }),
     });
   } catch (error) {
     console.error(`Translation failed for ${message.id}:`, error.message);
   }
+}
+
+async function discordApi(path, options = {}) {
+  const response = await fetch(`https://discord.com/api/v10${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  if (!response.ok) throw new Error(`Discord API ${response.status}: ${await response.text()}`);
+  return response.status === 204 ? null : response.json();
 }
 
 async function flushTranslationQueue() {
@@ -288,15 +305,18 @@ function requestPeakUpdate() {
 }
 
 async function announce(envName, title, fields, color = 0x57f287) {
-  const target = await channel(envName);
-  if (!target?.isTextBased()) return;
+  const channelId = process.env[envName];
+  if (!channelId) return;
   const embed = new EmbedBuilder().setTitle(clean(title)).setColor(color).setTimestamp();
   embed.addFields(fields.map(([name, value, inline = true]) => ({
     name: clean(name, 100),
     value: detailText(value),
     inline,
   })));
-  await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  await discordApi(`/channels/${channelId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ embeds: [embed.toJSON()], allowed_mentions: { parse: [] } }),
+  });
 }
 
 async function updateLeaderboardMessage(category) {
@@ -441,6 +461,66 @@ client.on("messageCreate", (message) => {
   void flushTranslationQueue();
 });
 
+function runGatewaySession() {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket("wss://gateway.discord.gg/?v=10&encoding=json");
+    let sequence = null;
+    let heartbeat = null;
+
+    const stop = () => {
+      if (heartbeat) clearInterval(heartbeat);
+    };
+
+    socket.addEventListener("open", () => console.log("Discord gateway socket open"));
+    socket.addEventListener("error", () => {
+      stop();
+      reject(new Error("Discord gateway socket error"));
+    });
+    socket.addEventListener("close", () => {
+      stop();
+      resolve();
+    });
+    socket.addEventListener("message", (event) => {
+      const packet = JSON.parse(String(event.data));
+      if (packet.s != null) sequence = packet.s;
+
+      if (packet.op === 10) {
+        const sendHeartbeat = () => socket.send(JSON.stringify({ op: 1, d: sequence }));
+        heartbeat = setInterval(sendHeartbeat, packet.d.heartbeat_interval);
+        socket.send(JSON.stringify({
+          op: 2,
+          d: {
+            token: process.env.DISCORD_TOKEN,
+            intents: 33281,
+            properties: { os: "windows", browser: "gtd-translator", device: "gtd-translator" },
+          },
+        }));
+      } else if (packet.op === 7 || packet.op === 9) {
+        socket.close();
+      } else if (packet.op === 0 && packet.t === "READY") {
+        console.log(`Discord gateway ready as ${packet.d.user.username}`);
+      } else if (packet.op === 0 && packet.t === "MESSAGE_CREATE") {
+        const message = packet.d;
+        if (process.env.ENABLE_WEBHOOK_TRANSLATION === "false") return;
+        if (!message.webhook_id || message.channel_id !== process.env.CHANNEL_CHAT_LOG) return;
+        translationQueue.push({ id: message.id, channelId: message.channel_id, content: message.content });
+        void flushTranslationQueue();
+      }
+    });
+  });
+}
+
+async function connectRawGateway() {
+  while (true) {
+    try {
+      await runGatewaySession();
+    } catch (error) {
+      console.error("Raw Discord gateway failed:", error);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+}
+
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName === "players") {
@@ -532,4 +612,4 @@ async function connectDiscord() {
   }
 }
 
-void connectDiscord();
+void connectRawGateway();
