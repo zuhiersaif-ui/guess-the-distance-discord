@@ -1,6 +1,7 @@
 import "dotenv/config";
 import crypto from "node:crypto";
 import express from "express";
+import translate from "google-translate-api-x";
 import {
   ChannelType,
   Client,
@@ -17,7 +18,13 @@ for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing ${key}`);
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
 const app = express();
 app.use(express.json({ limit: "64kb" }));
 
@@ -31,6 +38,16 @@ const state = {
   totals: { joins: 0, leaves: 0, purchases: 0, chatMessages: 0, moderationActions: 0 },
 };
 
+const channelCache = new Map();
+let liveStatusMessage = null;
+let lastPresenceSignature = "";
+let presenceUpdateRunning = false;
+let presenceUpdatePending = false;
+let peakUpdateRunning = false;
+let peakUpdatePending = false;
+const translationQueue = [];
+let translationQueueRunning = false;
+
 app.get("/", (_req, res) => res.json({ ok: true, service: "guess-the-distance-discord" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -42,6 +59,42 @@ function authorized(req) {
 
 function clean(value, max = 200) {
   return String(value ?? "").replace(/@/g, "＠").replace(/[\r\n]+/g, " ").trim().slice(0, max);
+}
+
+async function translateWebhookMessage(message) {
+  const raw = String(message.content || "").trim();
+  if (!raw) return;
+
+  const playerMatch = raw.match(/^([^:\n]{1,80}):\s*(.+)$/s);
+  const player = playerMatch?.[1]?.trim();
+  const source = playerMatch?.[2]?.trim() || raw;
+
+  try {
+    const result = await translate(source, { to: "en", autoCorrect: false });
+    const translated = String(result.text || "").trim();
+    const detected = result.from?.language?.iso;
+    if (!translated || detected === "en" || translated.toLowerCase() === source.toLowerCase()) return;
+
+    const content = player
+      ? `🌐 **${clean(player, 80)}:** ${translated}`
+      : `🌐 ${translated}`;
+    await message.reply({
+      content: content.slice(0, 2000),
+      allowedMentions: { parse: [], repliedUser: false },
+    });
+  } catch (error) {
+    console.error(`Translation failed for ${message.id}:`, error.message);
+  }
+}
+
+async function flushTranslationQueue() {
+  if (translationQueueRunning) return;
+  translationQueueRunning = true;
+  try {
+    while (translationQueue.length) await translateWebhookMessage(translationQueue.shift());
+  } finally {
+    translationQueueRunning = false;
+  }
 }
 
 function detailText(value) {
@@ -64,11 +117,33 @@ function productionPayload(body) {
 async function channel(envName) {
   const id = process.env[envName];
   if (!id) return null;
-  return client.channels.fetch(id).catch(() => null);
+  const cached = channelCache.get(id) || client.channels.cache.get(id);
+  if (cached) {
+    channelCache.set(id, cached);
+    return cached;
+  }
+  const fetched = await client.channels.fetch(id).catch(() => null);
+  if (fetched) channelCache.set(id, fetched);
+  return fetched;
 }
 
 function allPlayers() {
   return [...state.servers.values()].flatMap((server) => server.players || []);
+}
+
+function applyPlayerEvent(jobId, event, player) {
+  if (!jobId || !["join", "leave"].includes(event)) return;
+  const existing = state.servers.get(jobId) || { players: [], server: {}, updatedAt: Date.now() };
+  const playerKey = String(player.userId || player.name || "");
+  if (!playerKey) return;
+  const matches = (item) => String(item.userId || item.name || "") === playerKey;
+  existing.players = event === "join"
+    ? [...existing.players.filter((item) => !matches(item)), player].slice(0, 100)
+    : existing.players.filter((item) => !matches(item));
+  existing.updatedAt = Date.now();
+  state.servers.set(jobId, existing);
+  requestPresenceUpdate();
+  if (event === "join") requestPeakUpdate();
 }
 
 function queueRelay(author, content) {
@@ -110,6 +185,7 @@ async function announcePeak() {
   if (count <= state.peakPlayers || count < 1) return;
   const previous = state.peakPlayers;
   state.peakPlayers = count;
+  requestPresenceUpdate();
   const target = await channel("CHANNEL_ANNOUNCEMENTS");
   if (!target?.isTextBased()) return;
   const embed = new EmbedBuilder()
@@ -126,12 +202,20 @@ async function announcePeak() {
 
 async function updatePresence() {
   if (!client.user) return;
-  const count = allPlayers().length;
+  const players = allPlayers();
+  const count = players.length;
   const serverCount = state.servers.size;
+  const signature = JSON.stringify([
+    count,
+    serverCount,
+    state.peakPlayers,
+    ...players.slice(0, 25).map((player) => [player.userId, player.name, player.displayName, player.wins]),
+  ]);
+  if (signature === lastPresenceSignature) return;
   client.user.setActivity(`${count} player${count === 1 ? "" : "s"} guessing`);
   const target = await channel("CHANNEL_LIVE_PLAYERS");
   if (!target?.isTextBased()) return;
-  const rows = allPlayers().slice(0, 25)
+  const rows = players.slice(0, 25)
     .map((p) => `• **${clean(p.displayName || p.name)}** — ${Number(p.wins || 0).toLocaleString("en-US")} wins`)
     .join("\n");
   const embed = new EmbedBuilder()
@@ -145,14 +229,59 @@ async function updatePresence() {
     .setColor(0x5865f2)
     .setFooter({ text: "Published servers only • refreshes automatically" })
     .setTimestamp();
-  const messages = await target.messages.fetch({ limit: 10 });
-  const previous = messages.find((message) => {
-    if (message.author.id !== client.user.id) return false;
-    const title = message.embeds[0]?.title || "";
-    return title === "Guess the Distance • Live Status" || title.startsWith("Live players:");
-  });
-  if (previous) await previous.edit({ embeds: [embed] });
-  else await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  if (!liveStatusMessage) {
+    const messages = await target.messages.fetch({ limit: 10 });
+    liveStatusMessage = messages.find((message) => {
+      if (message.author.id !== client.user.id) return false;
+      const title = message.embeds[0]?.title || "";
+      return title === "Guess the Distance • Live Status" || title.startsWith("Live players:");
+    }) || null;
+  }
+  try {
+    liveStatusMessage = liveStatusMessage
+      ? await liveStatusMessage.edit({ embeds: [embed] })
+      : await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
+    lastPresenceSignature = signature;
+  } catch (error) {
+    liveStatusMessage = null;
+    throw error;
+  }
+}
+
+async function flushPresenceUpdates() {
+  if (presenceUpdateRunning || !client.user) return;
+  presenceUpdateRunning = true;
+  try {
+    do {
+      presenceUpdatePending = false;
+      await updatePresence();
+    } while (presenceUpdatePending);
+  } finally {
+    presenceUpdateRunning = false;
+  }
+}
+
+function requestPresenceUpdate() {
+  presenceUpdatePending = true;
+  void flushPresenceUpdates().catch((error) => console.error("Presence update failed:", error));
+}
+
+async function flushPeakUpdates() {
+  if (peakUpdateRunning || !client.user) return;
+  peakUpdateRunning = true;
+  try {
+    do {
+      peakUpdatePending = false;
+      await announcePeak();
+    } while (peakUpdatePending);
+  } finally {
+    peakUpdateRunning = false;
+  }
+}
+
+function requestPeakUpdate() {
+  peakUpdatePending = true;
+  void flushPeakUpdates().catch((error) => console.error("Peak update failed:", error));
 }
 
 async function announce(envName, title, fields, color = 0x57f287) {
@@ -198,7 +327,7 @@ app.use("/roblox", (req, res, next) => {
   next();
 });
 
-app.post("/roblox/heartbeat", async (req, res) => {
+app.post("/roblox/heartbeat", (req, res) => {
   if (!productionPayload(req.body)) {
     return res.status(202).json({ ok: true, ignored: "non-production" });
   }
@@ -208,9 +337,9 @@ app.post("/roblox/heartbeat", async (req, res) => {
     server: req.body.server || {},
     updatedAt: Date.now(),
   });
-  await updatePresence();
-  await announcePeak();
   res.json({ ok: true });
+  requestPresenceUpdate();
+  requestPeakUpdate();
 });
 
 app.post("/roblox/event", async (req, res) => {
@@ -248,7 +377,7 @@ app.post("/roblox/event", async (req, res) => {
     ], 0x57f287);
   } else if (event === "server_stop") {
     state.servers.delete(clean(req.body.jobId, 100));
-    await updatePresence();
+    requestPresenceUpdate();
     await announce("CHANNEL_GAME_EVENTS", "Server offline", [
       ["Server", req.body.jobId],
       ["Details", req.body.details, false],
@@ -256,6 +385,7 @@ app.post("/roblox/event", async (req, res) => {
   } else if (["join", "leave", "round_win"].includes(event)) {
     if (event === "join") state.totals.joins += 1;
     if (event === "leave") state.totals.leaves += 1;
+    applyPlayerEvent(clean(req.body.jobId, 100), event, p);
     await announce("CHANNEL_GAME_EVENTS", event.replaceAll("_", " "), [["Player", p.displayName || p.name], ["Details", req.body.details || "—", false]], 0x3498db);
   }
   res.json({ ok: true });
@@ -300,6 +430,13 @@ const commands = [
   )),
   new SlashCommandBuilder().setName("setup").setDescription("Create the recommended channel layout").setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ].map((c) => c.toJSON());
+
+client.on("messageCreate", (message) => {
+  if (process.env.ENABLE_WEBHOOK_TRANSLATION === "false") return;
+  if (!message.webhookId || message.channelId !== process.env.CHANNEL_CHAT_LOG) return;
+  translationQueue.push(message);
+  void flushTranslationQueue();
+});
 
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -357,8 +494,14 @@ client.once("clientReady", async () => {
 
 setInterval(() => {
   const staleBefore = Date.now() - 180_000;
-  for (const [jobId, server] of state.servers) if (server.updatedAt < staleBefore) state.servers.delete(jobId);
-  updatePresence().catch(console.error);
+  let changed = false;
+  for (const [jobId, server] of state.servers) {
+    if (server.updatedAt < staleBefore) {
+      state.servers.delete(jobId);
+      changed = true;
+    }
+  }
+  if (changed) requestPresenceUpdate();
 }, 60_000);
 
 await client.login(process.env.DISCORD_TOKEN);
