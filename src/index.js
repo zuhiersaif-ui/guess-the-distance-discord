@@ -1,5 +1,6 @@
 import "dotenv/config";
 import crypto from "node:crypto";
+import dns from "node:dns";
 import express from "express";
 import translate from "google-translate-api-x";
 import {
@@ -12,6 +13,8 @@ import {
   Routes,
   SlashCommandBuilder,
 } from "discord.js";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const required = ["DISCORD_TOKEN", "DISCORD_GUILD_ID", "ROBLOX_SHARED_SECRET"];
 for (const key of required) {
