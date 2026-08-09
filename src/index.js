@@ -505,7 +505,28 @@ setInterval(() => {
 }, 60_000);
 
 app.listen(Number(process.env.PORT || 3000), () => console.log(`Roblox bridge listening on port ${process.env.PORT || 3000}`));
-client.login(process.env.DISCORD_TOKEN).catch((error) => {
-  console.error("Discord login failed:", error);
-  process.exitCode = 1;
+
+client.on("error", (error) => console.error("Discord client error:", error));
+client.on("shardError", (error) => console.error("Discord gateway error:", error));
+client.on("shardDisconnect", (event, shardId) => {
+  console.warn(`Discord shard ${shardId} disconnected (${event.code})`);
 });
+
+async function connectDiscord() {
+  while (!client.isReady()) {
+    try {
+      console.log("Connecting to Discord...");
+      await Promise.race([
+        client.login(process.env.DISCORD_TOKEN),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Discord connection timed out")), 30_000)),
+      ]);
+      if (client.isReady()) return;
+    } catch (error) {
+      console.error("Discord login failed; retrying:", error);
+      client.destroy();
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    }
+  }
+}
+
+void connectDiscord();
