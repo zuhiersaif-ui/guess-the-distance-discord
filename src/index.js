@@ -504,5 +504,8 @@ setInterval(() => {
   if (changed) requestPresenceUpdate();
 }, 60_000);
 
-await client.login(process.env.DISCORD_TOKEN);
 app.listen(Number(process.env.PORT || 3000), () => console.log(`Roblox bridge listening on port ${process.env.PORT || 3000}`));
+client.login(process.env.DISCORD_TOKEN).catch((error) => {
+  console.error("Discord login failed:", error);
+  process.exitCode = 1;
+});
