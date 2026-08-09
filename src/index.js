@@ -64,6 +64,14 @@ function clean(value, max = 200) {
   return String(value ?? "").replace(/@/g, "＠").replace(/[\r\n]+/g, " ").trim().slice(0, max);
 }
 
+function isUsefulTranslation(source) {
+  const normalized = source.toLowerCase().replace(/[^a-z]/g, "");
+  if (!normalized || normalized.length < 2) return false;
+  if (/^(?:ha)+h?$|^(?:he)+h?$|^(?:hi)+h?$|^(?:w?k)+w?$/.test(normalized)) return false;
+  if (/^(lol|lmao|lmfao|rofl|xd+)$/.test(normalized)) return false;
+  return true;
+}
+
 async function translateWebhookMessage(message) {
   const raw = String(message.content || "").trim();
   if (!raw) return;
@@ -71,6 +79,7 @@ async function translateWebhookMessage(message) {
   const playerMatch = raw.match(/^([^:\n]{1,80}):\s*(.+)$/s);
   const player = playerMatch?.[1]?.trim();
   const source = playerMatch?.[2]?.trim() || raw;
+  if (!isUsefulTranslation(source)) return;
 
   try {
     const result = await translate(source, { to: "en", autoCorrect: false });
@@ -79,14 +88,13 @@ async function translateWebhookMessage(message) {
     if (!translated || detected === "en" || translated.toLowerCase() === source.toLowerCase()) return;
 
     const content = player
-      ? `🌐 **${clean(player, 80)}:** ${translated}`
+      ? `🌐 ${clean(player, 80)}: ${translated}`
       : `🌐 ${translated}`;
     await discordApi(`/channels/${message.channelId}/messages`, {
       method: "POST",
       body: JSON.stringify({
-      content: content.slice(0, 2000),
-        message_reference: { message_id: message.id, fail_if_not_exists: false },
-        allowed_mentions: { parse: [], replied_user: false },
+        content: content.slice(0, 2000),
+        allowed_mentions: { parse: [] },
       }),
     });
   } catch (error) {
