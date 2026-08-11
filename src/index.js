@@ -44,12 +44,11 @@ const state = {
 const channelCache = new Map();
 let liveStatusMessage = null;
 let lastPresenceSignature = "";
+let botUserId = "";
 let presenceUpdateRunning = false;
 let presenceUpdatePending = false;
 let peakUpdateRunning = false;
 let peakUpdatePending = false;
-const translationQueue = [];
-let translationQueueRunning = false;
 
 app.get("/", (_req, res) => res.json({ ok: true, service: "guess-the-distance-discord" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -74,22 +73,43 @@ function isUsefulTranslation(source) {
 
 async function translateWebhookMessage(message) {
   const raw = String(message.content || "").trim();
-  if (!raw) return;
+  // The Roblox relay now includes its own translation. Do not translate it twice.
+  if (!raw || raw.includes("🌐")) return;
 
-  const playerMatch = raw.match(/^([^:\n]{1,80}):\s*(.+)$/s);
-  const player = playerMatch?.[1]?.trim();
-  const source = playerMatch?.[2]?.trim() || raw;
-  if (!isUsefulTranslation(source)) return;
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const playerMatch = line.match(/^([^:]{1,80}):\s*(.+)$/);
+      return {
+        player: playerMatch?.[1]?.trim() || "",
+        source: playerMatch?.[2]?.trim() || line,
+      };
+    })
+    .filter(({ source }) => isUsefulTranslation(source));
+  if (!lines.length) return;
 
   try {
-    const result = await translate(source, { to: "en", autoCorrect: false });
-    const translated = String(result.text || "").trim();
-    const detected = result.from?.language?.iso;
-    if (!translated || detected === "en" || translated.toLowerCase() === source.toLowerCase()) return;
+    // One batch request is much faster than translating every chat line one by one.
+    const results = await translate(lines.map(({ source }) => source), {
+      to: "en",
+      autoCorrect: false,
+      client: "gtx",
+      rejectOnPartialFail: false,
+    });
+    const translatedLines = lines.flatMap(({ player, source }, index) => {
+      const result = results[index];
+      const translated = String(result?.text || "").trim();
+      const detected = result?.from?.language?.iso;
+      if (!translated || detected === "en" || translated.toLowerCase() === source.toLowerCase()) return [];
+      return player
+        ? [`**${clean(player, 80)}:** ${clean(translated, 500)}`]
+        : [clean(translated, 500)];
+    });
+    if (!translatedLines.length) return;
 
-    const content = player
-      ? `🌐 ${clean(player, 80)}: ${translated}`
-      : `🌐 ${translated}`;
+    const content = `🌐 **English translation**\n${translatedLines.join("\n")}`;
     await discordApi(`/channels/${message.channelId}/messages`, {
       method: "POST",
       body: JSON.stringify({
@@ -115,14 +135,11 @@ async function discordApi(path, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
-async function flushTranslationQueue() {
-  if (translationQueueRunning) return;
-  translationQueueRunning = true;
-  try {
-    while (translationQueue.length) await translateWebhookMessage(translationQueue.shift());
-  } finally {
-    translationQueueRunning = false;
-  }
+async function getBotUserId() {
+  if (botUserId) return botUserId;
+  const me = await discordApi("/users/@me");
+  botUserId = me.id;
+  return botUserId;
 }
 
 function detailText(value) {
@@ -328,8 +345,8 @@ async function announce(envName, title, fields, color = 0x57f287) {
 }
 
 async function updateLeaderboardMessage(category) {
-  const target = await channel("CHANNEL_LEADERBOARDS");
-  if (!target?.isTextBased()) return;
+  const channelId = process.env.CHANNEL_LEADERBOARDS;
+  if (!channelId) return;
   const rows = state.leaderboard[category] || [];
   const labels = { wins: "Most Wins", richest: "Richest Players", streak: "Best Streaks", donate: "Top Donators", fastest: "Fastest Times" };
   const formatValue = (value) => {
@@ -347,10 +364,26 @@ async function updateLeaderboardMessage(category) {
     .setColor(0x9b59b6)
     .setFooter({ text: "Live production leaderboard • top 25" })
     .setTimestamp();
-  const messages = await target.messages.fetch({ limit: 100 });
-  const previous = messages.find((message) => message.author.id === client.user.id && message.embeds[0]?.title === (labels[category] || category));
-  if (previous) await previous.edit({ embeds: [embed] });
-  else await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  const [messages, ownUserId] = await Promise.all([
+    discordApi(`/channels/${channelId}/messages?limit=100`),
+    getBotUserId(),
+  ]);
+  const previous = messages.find((message) => (
+    message.author.id === ownUserId
+      && message.embeds[0]?.title === (labels[category] || category)
+  ));
+  const payload = JSON.stringify({ embeds: [embed.toJSON()], allowed_mentions: { parse: [] } });
+  if (previous) {
+    await discordApi(`/channels/${channelId}/messages/${previous.id}`, {
+      method: "PATCH",
+      body: payload,
+    });
+  } else {
+    await discordApi(`/channels/${channelId}/messages`, {
+      method: "POST",
+      body: payload,
+    });
+  }
 }
 
 app.use("/roblox", (req, res, next) => {
@@ -465,8 +498,7 @@ const commands = [
 client.on("messageCreate", (message) => {
   if (process.env.ENABLE_WEBHOOK_TRANSLATION === "false") return;
   if (!message.webhookId || message.channelId !== process.env.CHANNEL_CHAT_LOG) return;
-  translationQueue.push(message);
-  void flushTranslationQueue();
+  void translateWebhookMessage(message);
 });
 
 function runGatewaySession() {
@@ -511,8 +543,7 @@ function runGatewaySession() {
         const message = packet.d;
         if (process.env.ENABLE_WEBHOOK_TRANSLATION === "false") return;
         if (!message.webhook_id || message.channel_id !== process.env.CHANNEL_CHAT_LOG) return;
-        translationQueue.push({ id: message.id, channelId: message.channel_id, content: message.content });
-        void flushTranslationQueue();
+        void translateWebhookMessage({ id: message.id, channelId: message.channel_id, content: message.content });
       }
     });
   });
